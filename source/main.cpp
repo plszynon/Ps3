@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include <net/net.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
@@ -48,6 +49,7 @@ static volatile u32 running = 0;
 static u32 *canvas = NULL;   // bufor programowy
 static Bitmap screenBmp;     // kopia w pamieci RSX
 static int W, H;
+static int g_netInit = -1;
 
 struct Bookmark { std::string name, url; };
 static std::vector<Bookmark> bookmarks;
@@ -180,7 +182,9 @@ static bool http_exchange(bool tls, const std::string &host, int port,
 {
 	struct hostent *he = gethostbyname(host.c_str());
 	if (!he || !he->h_addr_list || !he->h_addr_list[0]) {
-		err = "Nie mozna znalezc serwera: " + host + "\nSprawdz polaczenie z internetem w ustawieniach PS3.";
+		char nb[48];
+		snprintf(nb, sizeof(nb), "\n(kod sieci: %d)", g_netInit);
+		err = "Nie mozna znalezc serwera: " + host + "\nSprawdz polaczenie z internetem w ustawieniach PS3." + nb;
 		return false;
 	}
 
@@ -398,6 +402,7 @@ int main(int argc, const char *argv[])
 	void *host_addr = memalign(1024 * 1024, HOST_SIZE);
 	init_screen(host_addr, HOST_SIZE);
 	ioPadInit(7);
+	g_netInit = netInitialize(); // bez tego DNS i gniazda nie dzialaja
 
 	atexit(program_exit_callback);
 	sysUtilRegisterCallback(0, sysutil_exit_callback, NULL);
@@ -499,6 +504,7 @@ int main(int argc, const char *argv[])
 		flip();
 	}
 
+	netDeinitialize();
 	bitmapDestroy(&screenBmp);
 	free(canvas);
 	return 0;
