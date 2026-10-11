@@ -11,8 +11,8 @@ std::string html_to_text(const std::string &html);
 // Zawija tekst na linie o max `cols` znakow.
 std::vector<std::string> wrap_text(const std::string &text, int cols);
 
-// Rozbija adres http://host[:port]/sciezka. Zwraca false dla innych adresow.
-bool parse_http_url(const std::string &url, std::string &host, int &port, std::string &path);
+// Rozbija adres http(s)://host[:port]/sciezka. Zwraca false dla innych adresow.
+bool parse_url(const std::string &url, bool &tls, std::string &host, int &port, std::string &path);
 
 // Usuwa naglowki odpowiedzi HTTP; zwraca kod statusu, a w `location` adres przekierowania.
 int split_http_response(const std::string &raw, std::string &body, std::string &location);

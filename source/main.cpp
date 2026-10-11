@@ -23,6 +23,12 @@
 #include <string>
 #include <vector>
 
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/error.h>
+#include <mbedtls/net_sockets.h>
+
 #include "rsxutil.h"
 #include "bitmap.h"
 #include "textproc.h"
@@ -133,10 +139,10 @@ static void load_bookmarks()
 	}
 	if (bookmarks.empty()) {
 		const char *defs[][2] = {
-			{"Example",        "http://example.com/"},
-			{"Pierwsza strona WWW", "http://info.cern.ch/"},
-			{"NPR (tekst)",    "http://text.npr.org/"},
-			{"Pogoda (wttr)",  "http://wttr.in/Warszawa?0T"},
+			{"Example",              "https://example.com/"},
+			{"NPR (tekst)",          "https://text.npr.org/"},
+			{"DuckDuckGo (szukaj)",  "https://lite.duckduckgo.com/lite/"},
+			{"Pierwsza strona WWW",  "http://info.cern.ch/"},
 		};
 		for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
 			Bookmark b; b.name = defs[i][0]; b.url = defs[i][1];
@@ -145,61 +151,161 @@ static void load_bookmarks()
 	}
 }
 
-// ---------------------------------------------------------------- HTTP
+// ---------------------------------------------------------------- HTTP / HTTPS
 #define MAX_PAGE (256 * 1024)
 
-// Zwraca true i wypelnia `text`, albo false i wstawia komunikat bledu w `text`.
-static bool fetch_page(const std::string &startUrl, std::string &text)
+static int bio_send(void *ctx, const unsigned char *buf, size_t len)
 {
-	std::string url = startUrl;
+	int r = send(*(int *)ctx, buf, len, 0);
+	return (r < 0) ? MBEDTLS_ERR_NET_SEND_FAILED : r;
+}
 
-	for (int redirects = 0; redirects < 4; redirects++) {
-		std::string host, path; int port;
-		if (!parse_http_url(url, host, port, path)) {
-			text = "Ten adres nie jest obslugiwany:\n" + url +
-			       "\n\nObslugiwane sa tylko adresy http:// (bez HTTPS).";
-			return false;
-		}
+static int bio_recv(void *ctx, unsigned char *buf, size_t len)
+{
+	int r = recv(*(int *)ctx, buf, len, 0);
+	return (r < 0) ? MBEDTLS_ERR_NET_RECV_FAILED : r;
+}
 
-		struct hostent *he = gethostbyname(host.c_str());
-		if (!he || !he->h_addr_list || !he->h_addr_list[0]) {
-			text = "Nie mozna znalezc serwera: " + host + "\nSprawdz polaczenie z internetem w ustawieniach PS3.";
-			return false;
-		}
+static std::string tls_error(const char *what, int ret)
+{
+	char eb[128];
+	mbedtls_strerror(ret, eb, sizeof(eb));
+	return std::string(what) + ": " + eb;
+}
 
-		int s = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (s < 0) { text = "Nie mozna utworzyc gniazda."; return false; }
+// Wysyla zapytanie i czyta cala odpowiedz. Przy HTTPS uzywa mbedTLS (TLS 1.2).
+// UWAGA: certyfikaty serwera NIE sa weryfikowane (brak paczki certyfikatow CA).
+static bool http_exchange(bool tls, const std::string &host, int port,
+                          const std::string &req, std::string &raw, std::string &err)
+{
+	struct hostent *he = gethostbyname(host.c_str());
+	if (!he || !he->h_addr_list || !he->h_addr_list[0]) {
+		err = "Nie mozna znalezc serwera: " + host + "\nSprawdz polaczenie z internetem w ustawieniach PS3.";
+		return false;
+	}
 
-		struct sockaddr_in server;
-		memset(&server, 0, sizeof(server));
-		server.sin_len = sizeof(server);
-		server.sin_family = AF_INET;
-		server.sin_port = htons(port);
-		memcpy(&server.sin_addr, he->h_addr_list[0], sizeof(server.sin_addr));
+	int s = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s < 0) { err = "Nie mozna utworzyc gniazda."; return false; }
 
-		if (connect(s, (struct sockaddr *)&server, sizeof(server)) != 0) {
-			close(s);
-			text = "Nie mozna polaczyc z serwerem: " + host;
-			return false;
-		}
+	struct sockaddr_in server;
+	memset(&server, 0, sizeof(server));
+	server.sin_len = sizeof(server);
+	server.sin_family = AF_INET;
+	server.sin_port = htons(port);
+	memcpy(&server.sin_addr, he->h_addr_list[0], sizeof(server.sin_addr));
 
-		std::string req = "GET " + path + " HTTP/1.0\r\nHost: " + host +
-		                  "\r\nUser-Agent: NowaKarta/1.0 (PS3)\r\nAccept: text/html,text/plain\r\n"
-		                  "Connection: close\r\n\r\n";
+	if (connect(s, (struct sockaddr *)&server, sizeof(server)) != 0) {
+		close(s);
+		err = "Nie mozna polaczyc z serwerem: " + host;
+		return false;
+	}
+
+	char buf[4096];
+
+	if (!tls) {
 		if (send(s, req.c_str(), req.size(), 0) < 0) {
 			close(s);
-			text = "Nie mozna wyslac zapytania.";
+			err = "Nie mozna wyslac zapytania.";
 			return false;
 		}
-
-		std::string raw;
-		char buf[4096];
 		while (raw.size() < MAX_PAGE) {
 			int n = recv(s, buf, sizeof(buf), 0);
 			if (n <= 0) break;
 			raw.append(buf, n);
 		}
 		close(s);
+		return true;
+	}
+
+	// ---- TLS
+	mbedtls_ssl_context ssl;
+	mbedtls_ssl_config conf;
+	mbedtls_entropy_context entropy;
+	mbedtls_ctr_drbg_context drbg;
+	mbedtls_ssl_init(&ssl);
+	mbedtls_ssl_config_init(&conf);
+	mbedtls_entropy_init(&entropy);
+	mbedtls_ctr_drbg_init(&drbg);
+
+	bool ok = false;
+	int ret = 0;
+	const char *pers = "nowakarta";
+
+	do {
+		ret = mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy,
+		                            (const unsigned char *)pers, strlen(pers));
+		if (ret != 0) { err = tls_error("TLS (generator losowy)", ret); break; }
+
+		ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+		                                  MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+		if (ret != 0) { err = tls_error("TLS (konfiguracja)", ret); break; }
+
+		mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+		mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
+
+		ret = mbedtls_ssl_setup(&ssl, &conf);
+		if (ret != 0) { err = tls_error("TLS (setup)", ret); break; }
+
+		mbedtls_ssl_set_hostname(&ssl, host.c_str()); // SNI
+		mbedtls_ssl_set_bio(&ssl, &s, bio_send, bio_recv, NULL);
+
+		while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+			if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) break;
+		}
+		if (ret != 0) { err = tls_error("Blad polaczenia HTTPS", ret); break; }
+
+		size_t off = 0;
+		bool wfail = false;
+		while (off < req.size()) {
+			ret = mbedtls_ssl_write(&ssl, (const unsigned char *)req.data() + off, req.size() - off);
+			if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+			if (ret < 0) { wfail = true; break; }
+			off += ret;
+		}
+		if (wfail) { err = tls_error("Blad wysylania (HTTPS)", ret); break; }
+
+		while (raw.size() < MAX_PAGE) {
+			ret = mbedtls_ssl_read(&ssl, (unsigned char *)buf, sizeof(buf));
+			if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+			if (ret <= 0) break; // koniec danych albo zamkniecie polaczenia
+			raw.append(buf, ret);
+		}
+		if (raw.empty() && ret < 0 && ret != MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+			err = tls_error("Blad odczytu (HTTPS)", ret);
+			break;
+		}
+		mbedtls_ssl_close_notify(&ssl);
+		ok = true;
+	} while (0);
+
+	mbedtls_ssl_free(&ssl);
+	mbedtls_ssl_config_free(&conf);
+	mbedtls_ctr_drbg_free(&drbg);
+	mbedtls_entropy_free(&entropy);
+	close(s);
+	return ok;
+}
+
+// Zwraca true i wypelnia `text`, albo false i wstawia komunikat bledu w `text`.
+static bool fetch_page(const std::string &startUrl, std::string &text)
+{
+	std::string url = startUrl;
+
+	for (int redirects = 0; redirects < 5; redirects++) {
+		bool tls; std::string host, path; int port;
+		if (!parse_url(url, tls, host, port, path)) {
+			text = "Ten adres nie jest obslugiwany:\n" + url +
+			       "\n\nObslugiwane sa adresy http:// i https://.";
+			return false;
+		}
+
+		std::string req = "GET " + path + " HTTP/1.0\r\nHost: " + host +
+		                  "\r\nUser-Agent: Mozilla/5.0 (PLAYSTATION 3) NowaKarta/1.0\r\n"
+		                  "Accept: text/html,text/plain\r\nAccept-Encoding: identity\r\n"
+		                  "Connection: close\r\n\r\n";
+
+		std::string raw, err;
+		if (!http_exchange(tls, host, port, req, raw, err)) { text = err; return false; }
 
 		std::string body, location;
 		int status = split_http_response(raw, body, location);
@@ -207,8 +313,8 @@ static bool fetch_page(const std::string &startUrl, std::string &text)
 		if ((status == 301 || status == 302 || status == 303 || status == 307 || status == 308) && !location.empty()) {
 			if (location[0] == '/') {
 				char pb[16] = "";
-				if (port != 80) snprintf(pb, sizeof(pb), ":%d", port);
-				location = "http://" + host + pb + location;
+				if (port != (tls ? 443 : 80)) snprintf(pb, sizeof(pb), ":%d", port);
+				location = std::string(tls ? "https://" : "http://") + host + pb + location;
 			}
 			url = location;
 			continue;
@@ -264,7 +370,7 @@ static void draw_home(int sel)
 	}
 
 	draw_text(boxX, H - 70, 1, COL_DIM, "D-pad: wybor     X: otworz     Kolo: wyjscie     Start: wczytaj zakladki ponownie");
-	draw_text(boxX, H - 52, 1, COL_DIM, "Wlasne zakladki: plik bookmarks.txt w USRDIR, linie w formacie: Nazwa|http://adres");
+	draw_text(boxX, H - 52, 1, COL_DIM, "Wlasne zakladki: plik bookmarks.txt w USRDIR, linie: Nazwa|https://adres   (HTTPS bez weryfikacji certyfikatow)");
 }
 
 static void draw_page(const std::string &url, const std::vector<std::string> &lines, int top, int rows, int scale)

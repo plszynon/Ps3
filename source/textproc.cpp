@@ -155,14 +155,17 @@ std::vector<std::string> wrap_text(const std::string &text, int cols)
 	return lines;
 }
 
-bool parse_http_url(const std::string &url, std::string &host, int &port, std::string &path)
+bool parse_url(const std::string &url, bool &tls, std::string &host, int &port, std::string &path)
 {
-	if (lower(url.substr(0, 7)) != "http://") return false;
-	std::string rest = url.substr(7);
+	std::string rest;
+	std::string pre = lower(url.substr(0, 8));
+	if (pre.compare(0, 8, "https://") == 0) { tls = true; port = 443; rest = url.substr(8); }
+	else if (pre.compare(0, 7, "http://") == 0) { tls = false; port = 80; rest = url.substr(7); }
+	else return false;
+
 	size_t slash = rest.find('/');
 	std::string hp = (slash == std::string::npos) ? rest : rest.substr(0, slash);
 	path = (slash == std::string::npos) ? "/" : rest.substr(slash);
-	port = 80;
 	size_t colon = hp.find(':');
 	if (colon != std::string::npos) {
 		port = atoi(hp.c_str() + colon + 1);

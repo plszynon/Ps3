@@ -1,5 +1,5 @@
-# Format: Nazwa|http://adres   (tylko http://, bez HTTPS)
-Example|http://example.com/
+# Format: Nazwa|adres   (http:// lub https://)
+Example|https://example.com/
+NPR (tekst)|https://text.npr.org/
+DuckDuckGo (szukaj)|https://lite.duckduckgo.com/lite/
 Pierwsza strona WWW|http://info.cern.ch/
-NPR (tekst)|http://text.npr.org/
-Pogoda (wttr)|http://wttr.in/Warszawa?0T

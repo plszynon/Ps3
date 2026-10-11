@@ -1,12 +1,55 @@
 name: build
+
 on: [push, workflow_dispatch]
+
+env:
+  TOOLCHAIN_URL: https://github.com/ps3dev/ps3toolchain/releases/download/2026-06-09/ps3dev-92534e60-ubuntu-latest.tar.gz
+  NO_SAVANNAH: 1
+
 jobs:
   pkg:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker run --rm -v "$PWD:/src" -w /src ps3dev/ps3dev make pkg
+
+      - name: Zaleznosci
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install autoconf automake bison flex gcc libelf-dev make texinfo \
+            patch wget zlib1g-dev libtool-bin bzip2 pkg-config python3 python-is-python3 \
+            libssl-dev libgmp3-dev
+
+      - name: Toolchain PS3 (gotowy, z GitHub Releases)
+        run: |
+          mkdir -p "$HOME/sdk"
+          curl -sL "$TOOLCHAIN_URL" | tar xz -C "$HOME/sdk"
+          test -d "$HOME/sdk/ps3dev/ppu/bin"
+          echo "PS3DEV=$HOME/sdk/ps3dev" >> "$GITHUB_ENV"
+          echo "PSL1GHT=$HOME/sdk/ps3dev" >> "$GITHUB_ENV"
+          echo "$HOME/sdk/ps3dev/bin" >> "$GITHUB_PATH"
+          echo "$HOME/sdk/ps3dev/ppu/bin" >> "$GITHUB_PATH"
+          echo "$HOME/sdk/ps3dev/spu/bin" >> "$GITHUB_PATH"
+
+      - name: PSL1GHT
+        run: |
+          git clone --depth 1 https://github.com/ps3dev/PSL1GHT.git "$HOME/PSL1GHT"
+          cd "$HOME/PSL1GHT"
+          make install-ctrl
+          make
+          make install
+
+      - name: mbedTLS (HTTPS)
+        run: |
+          mkdir -p "$PS3DEV/portlibs/ppu/lib" "$PS3DEV/portlibs/ppu/include"
+          git clone --depth 1 https://github.com/ps3dev/ps3libraries.git "$HOME/ps3libraries"
+          cd "$HOME/ps3libraries"
+          ./libraries.sh 18
+
+      - name: Budowa PKG
+        run: make pkg
+
       - uses: actions/upload-artifact@v4
         with:
           name: NowaKarta-pkg
           path: "*.pkg"
+          if-no-files-found: error
